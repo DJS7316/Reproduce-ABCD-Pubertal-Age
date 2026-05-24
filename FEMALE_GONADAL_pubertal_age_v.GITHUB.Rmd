@@ -1,0 +1,927 @@
+---
+title: "FEMALE Gonadal Age Prediction"
+author: ""
+date: ""
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+#Loading Data
+setwd("")
+abcd <- readRDS("")
+variable.names(abcd)
+
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(caret)
+library(mgcv) # for GAM
+library(randomForest)
+library(xgboost)
+library(fmsb) # for radar chart
+library(mice) # for imputation (if needed)
+
+#Remove participants sub-53CVF7NB sub-K2KR1DUA
+abcd <- abcd %>%
+  filter(participant_id != "sub-53CVF7NB")
+
+abcd <- abcd %>%
+  filter(participant_id != "sub-K2KR1DUA")
+
+```
+
+```{r Initial Female Prediction of Age}
+
+#filter for females only
+
+abcd_female <- abcd %>%
+  filter(ab_g_stc__cohort_sex==2)
+
+
+
+#remove 999 from puberty dataset
+abcd_female[abcd_female == 999] <- NA
+abcd_female[abcd_female == 777] <- NA
+
+abcd_female$ph_y_pds__f_002[abcd_female$ph_p_pds__f_002==1] <- 4
+
+summary(abcd_female)
+
+
+```
+
+```{r Predicting Age - leakage-safe pipeline}
+
+# Corrected automatically to use the intended female gonadal predictor set.
+# -----------------------------
+# 1. Define outcome + predictors
+# -----------------------------
+target_str <- "ph_y_pds_age"
+
+predictors_age_gonadal <- c(
+  "ph_y_pds_001",
+  "ph_y_pds__f_001",
+  "ph_y_pds__f_002",
+  "ph_y_phs__hse_mean",
+  "ph_y_phs__ert_mean",
+  "ph_p_pds_001",
+  "ph_p_pds__f_001",
+  "ph_p_pds__f_002"
+)
+# Build formula
+formula_obj <- as.formula(
+ paste(target_str, "~", paste(predictors_age_gonadal, collapse = " + "))
+)
+print(formula_obj)
+
+# -----------------------------
+# 2. Create analysis dataset
+#    Keep only needed columns
+# -----------------------------
+analysis_df <- abcd_female %>%
+  select(participant_id,all_of(c(target_str, predictors_age_gonadal))) %>%
+  filter(!is.na(.data[[target_str]]))
+
+# Check outcome missingness after filtering
+sum(is.na(analysis_df[[target_str]]))
+
+# -----------------------------
+# 3. Train/test split FIRST
+# -----------------------------
+set.seed(123)
+trainIndex <- createDataPartition(
+  analysis_df[[target_str]],
+  p = 0.8,
+  list = FALSE
+)
+
+train_raw <- analysis_df[trainIndex, ]
+test_raw  <- analysis_df[-trainIndex, ]
+
+train_ids <- train_raw$participant_id
+test_ids <- test_raw$participant_id
+
+train_raw <- train_raw %>% select(-participant_id)
+test_raw <- test_raw %>% select(-participant_id)
+
+cat("Training N =", nrow(train_raw), "\n")
+cat("Test N =", nrow(test_raw), "\n")
+
+# -----------------------------
+# 4. Run MICE on TRAINING DATA ONLY
+# -----------------------------
+library(mice)
+
+impute_train <- mice(
+  train_raw,
+  m = 5,
+  maxit = 10,
+  seed = 123,
+  printFlag = TRUE
+)
+
+train_df <- complete(impute_train, action = "all")
+
+# -----------------------------
+# 5. Impute TEST DATA SEPARATELY
+#    Outcome is retained but not used
+#    to define train imputation
+# -----------------------------
+# Initialize mice on test data
+init_test <- mice(
+  test_raw,
+  m = 5,
+  maxit = 0,
+  printFlag = FALSE
+)
+
+meth_test <- init_test$method
+pred_test <- init_test$predictorMatrix
+
+# Do NOT impute outcome
+meth_test[target_str] <- ""
+
+# Do NOT use outcome to impute predictors in test set
+pred_test[, target_str] <- 0
+
+impute_test <- mice(
+  test_raw,
+  m = 5,
+  method = meth_test,
+  predictorMatrix = pred_test,
+  maxit = 10,
+  seed = 456,
+  printFlag = TRUE
+)
+
+test_df <- complete(impute_test, action = "all")
+
+# -----------------------------
+# 6. Scale predictors using TRAINING ONLY
+# -----------------------------
+numeric_predictors <- predictors_age_gonadal[
+  sapply(train_df[[1]][, predictors_age_gonadal, drop = FALSE], is.numeric)
+]
+
+# Estimate scaling parameters from first imputed training set
+# (keeps workflow simple and aligned across imputations)
+pp <- preProcess(
+  train_df[[1]][, numeric_predictors, drop = FALSE],
+  method = c("center", "scale")
+)
+
+# Apply scaling to each imputed training dataset
+train_df <- lapply(train_df, function(df) {
+  df[, numeric_predictors] <- predict(pp, df[, numeric_predictors, drop = FALSE])
+  df
+})
+
+# Apply SAME scaling parameters to each imputed test dataset
+test_df <- lapply(test_df, function(df) {
+  df[, numeric_predictors] <- predict(pp, df[, numeric_predictors, drop = FALSE])
+  df
+})
+
+# Confirm scaling on training predictors
+summary(train_df[[1]][, numeric_predictors, drop = FALSE])
+```
+
+
+```{r fit ML models}
+ctrl <- trainControl(method = "cv", number = 5)
+
+# Step 2 — Fit models
+
+set.seed(123)
+
+# -------------------------------
+# 1. Linear Regression (LM)
+# -------------------------------
+lm_fit <- lapply(seq_along(train_df), function(i) {
+  cat("\n==============================\n")
+  cat("Fitting LM — Imputation", i, "\n")
+  cat("==============================\n")
+  
+  train(
+    formula_obj,
+    data = train_df[[i]],
+    method = "lm",
+    trControl = ctrl
+  )
+})
+
+# -------------------------------
+# 2. Generalized Additive Model (GAM)
+# -------------------------------
+gam_fit <- lapply(seq_along(train_df), function(i) {
+  cat("\n==============================\n")
+  cat("Fitting GAM — Imputation", i, "\n")
+  cat("==============================\n")
+  
+  train(
+    formula_obj,
+    data = train_df[[i]],
+    method = "gam",
+    trControl = ctrl
+  )
+})
+
+# -------------------------------
+# 3. Random Forest (RF)
+# -------------------------------
+rf_fit <- lapply(seq_along(train_df), function(i) {
+  cat("\n==============================\n")
+  cat("Fitting Random Forest — Imputation", i, "\n")
+  cat("==============================\n")
+  
+  randomForest(
+    formula = formula_obj,
+    data = train_df[[i]],
+    ntree = 500,
+    importance = TRUE,
+    do.trace = 50  # prints progress every 50 trees
+  )
+})
+
+# -------------------------------
+# 4. XGBoost (XGB)
+# -------------------------------
+# -------------------------------
+# 4. XGBoost (XGB)
+# -------------------------------
+xgb_ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = TRUE,
+  allowParallel = TRUE
+)
+
+# Define a tuneGrid with tree parameters
+xgb_tuneGrid <- expand.grid(
+  nrounds = 100, # Number of boosting rounds
+  max_depth = 6, # Maximum depth of trees
+  eta = 0.3,     # Learning rate
+  gamma = 0,     # Minimum loss reduction
+  colsample_bytree = 0.8, # Subsample ratio of columns for each tree
+  min_child_weight = 1,    # Minimum number of data points in a child
+  subsample = 1
+)
+
+xgb_fit <- lapply(seq_along(train_df), function(i) {
+  cat("\n==============================\n")
+  cat("Fitting XGBoost — Imputation", i, "\n")
+  cat("==============================\n")
+  
+  train(
+    formula_obj,
+    data = train_df[[i]],
+    method = "xgbTree",
+    trControl = xgb_ctrl,
+    tuneGrid = xgb_tuneGrid,
+    verbose = 1  # This may help with additional logging during training
+  )
+})
+
+# -------------------------------
+# Predictions on test sets
+# -------------------------------
+predict_avg <- function(fit_list, test_list, method_type = c("caret","rf")) {
+  method_type <- match.arg(method_type)
+  
+  preds <- sapply(seq_along(fit_list), function(i) {
+    if (method_type == "caret") {
+      predict(fit_list[[i]], newdata = test_list[[i]])
+    } else if (method_type == "rf") {
+      predict(fit_list[[i]], newdata = test_list[[i]])
+    }
+  })
+  
+  rowMeans(preds)  # average across imputations
+}
+
+lm_preds_avg  <- predict_avg(lm_fit, test_df, method_type = "caret")
+gam_preds_avg <- predict_avg(gam_fit, test_df, method_type = "caret")
+rf_preds_avg  <- predict_avg(rf_fit, test_df, method_type = "rf")
+xgb_preds_avg <- predict_avg(xgb_fit, test_df, method_type = "caret")
+```
+## Including Plots
+
+```{r ML model interpretation}
+
+# -------------------------------
+# Compute performance metrics
+# -------------------------------
+calc_metrics <- function(preds, actual) {
+  c(
+    RMSE = RMSE(preds, actual),
+    MAE  = MAE(preds, actual),
+    R2   = R2(preds, actual)
+  )
+}
+
+results <- data.frame(
+  Method = c("LM", "GAM", "Random Forest", "XGBoost"),
+  rbind(
+    calc_metrics(lm_preds_avg, test_df[[1]][[target_str]]),
+    calc_metrics(gam_preds_avg, test_df[[1]][[target_str]]),
+    calc_metrics(rf_preds_avg, test_df[[1]][[target_str]]),
+    calc_metrics(xgb_preds_avg, test_df[[1]][[target_str]])
+  )
+)
+
+print(results)
+
+library(caret)
+library(ggplot2)
+library(dplyr)
+library(randomForest)
+library(xgboost)
+
+# -------------------------------
+# Helper function: caret models (LM, GAM)
+# -------------------------------
+get_caret_varimp <- function(fit_obj) {
+  # fit_obj can be a single caret model or a list of caret models (e.g., per imputation)
+  fits_list <- if (inherits(fit_obj, "train")) list(fit_obj) else fit_obj
+
+  imp_list <- lapply(fits_list, function(one_fit) {
+    vi <- caret::varImp(one_fit)$importance
+
+    # vi sometimes is a vector-like 1-col df; sometimes multiple cols
+    vi_df <- data.frame(
+      Feature = rownames(vi),
+      Importance = as.numeric(vi[[1]]),
+      stringsAsFactors = FALSE
+    )
+    rownames(vi_df) <- NULL
+    vi_df
+  })
+
+  # align by Feature, fill missing with 0, then average
+  all_features <- sort(unique(unlist(lapply(imp_list, `[[`, "Feature"))))
+
+  imp_mat <- sapply(imp_list, function(df_imp) {
+    vals <- setNames(df_imp$Importance, df_imp$Feature)
+    out <- vals[all_features]
+    out[is.na(out)] <- 0
+    as.numeric(out)
+  })
+
+  avg_imp <- rowMeans(imp_mat)
+
+  out_df <- data.frame(Feature = all_features, Importance = avg_imp, stringsAsFactors = FALSE)
+  out_df <- out_df[order(out_df$Importance, decreasing = TRUE), ]
+  out_df
+}
+
+# -------------------------------
+# Helper function: Random Forest
+# -------------------------------
+get_rf_varimp <- function(rf_list) {
+  imp_list <- lapply(rf_list, function(m) {
+    # Use %IncMSE for importance
+    data.frame(Feature = rownames(m$importance),
+               Importance = m$importance[, "%IncMSE"])
+  })
+  
+  # Average importance across imputations
+  all_features <- unique(unlist(lapply(imp_list, function(x) x$Feature)))
+  
+  avg_imp <- sapply(all_features, function(f) {
+    mean(sapply(imp_list, function(x) {
+      if (f %in% x$Feature) x$Importance[x$Feature == f] else NA
+    }), na.rm = TRUE)
+  })
+  
+  data.frame(Feature = all_features, Importance = avg_imp) %>%
+    arrange(desc(Importance))
+}
+
+# -------------------------------
+# Helper function: XGBoost
+# -------------------------------
+get_xgb_varimp <- function(xgb_list) {
+  imp_list <- lapply(xgb_list, function(m) {
+    imp <- xgb.importance(model = m$finalModel)
+    data.frame(Feature = imp$Feature, Importance = imp$Gain)
+  })
+  
+  # Average importance across imputations
+  all_features <- unique(unlist(lapply(imp_list, function(x) x$Feature)))
+  
+  avg_imp <- sapply(all_features, function(f) {
+    mean(sapply(imp_list, function(x) {
+      if (f %in% x$Feature) x$Importance[x$Feature == f] else NA
+    }), na.rm = TRUE)
+  })
+  
+  data.frame(Feature = all_features, Importance = avg_imp) %>%
+    arrange(desc(Importance))
+}
+
+# -------------------------------
+# Generate importance data frames
+# -------------------------------
+lm_imp  <- get_caret_varimp(lm_fit)
+gam_imp <- get_caret_varimp(gam_fit)
+rf_imp  <- get_rf_varimp(rf_fit)
+xgb_imp <- get_xgb_varimp(xgb_fit)
+
+# -------------------------------
+# Plot function
+# -------------------------------
+plot_varimp <- function(df, title) {
+  ggplot(df, aes(x = reorder(Feature, Importance), y = Importance)) +
+    geom_col(fill = "steelblue") +
+    coord_flip() +
+    labs(title = title, x = "Feature", y = "Importance") +
+    theme_minimal()
+}
+
+# -------------------------------
+# Plot all models
+# -------------------------------
+plot_varimp(lm_imp, "LM Variable Importance")
+plot_varimp(gam_imp, "GAM Variable Importance")
+plot_varimp(rf_imp, "Random Forest Variable Importance")
+plot_varimp(xgb_imp, "XGBoost Variable Importance")
+
+# Combine the feature importance data into a single data frame
+combine_varimp <- function(lm_imp, gam_imp, rf_imp, xgb_imp) {
+  # Add model names to each importance data frame
+  lm_imp$Model <- "Linear Regression"
+  gam_imp$Model <- "Generalized Additive Model"
+  rf_imp$Model <- "Random Forest"
+  xgb_imp$Model <- "XGBoost"
+  
+  # Combine all model importance data frames
+  combined_imp <- rbind(lm_imp, gam_imp, rf_imp, xgb_imp)
+  
+  # Make sure Features are factor to handle the plot properly
+  combined_imp$Feature <- factor(combined_imp$Feature, levels = unique(combined_imp$Feature))
+  
+  return(combined_imp)
+}
+
+# Combine importance from all models
+combined_imp <- combine_varimp(lm_imp, gam_imp, rf_imp, xgb_imp)
+
+# Print the combined feature importance data
+print(combined_imp)
+```
+
+```{r ML model interpretation 1a}
+
+# -------------------------------
+# Compute performance metrics
+# -------------------------------
+calc_metrics <- function(preds, actual) {
+  c(
+    RMSE = RMSE(preds, actual),
+    MAE  = MAE(preds, actual),
+    R2   = R2(preds, actual)
+  )
+}
+
+results <- data.frame(
+  Method = c("LM", "GAM", "Random Forest", "XGBoost"),
+  rbind(
+    calc_metrics(lm_preds_avg, test_df[[1]][[target_str]]),
+    calc_metrics(gam_preds_avg, test_df[[1]][[target_str]]),
+    calc_metrics(rf_preds_avg, test_df[[1]][[target_str]]),
+    calc_metrics(xgb_preds_avg, test_df[[1]][[target_str]])
+  )
+)
+
+print(results)
+
+library(caret)
+library(ggplot2)
+library(dplyr)
+library(randomForest)
+library(xgboost)
+
+# -------------------------------
+# Helper function: caret models (LM, GAM)
+# -------------------------------
+get_caret_varimp <- function(fit_obj) {
+  # fit_obj can be a single caret model or a list of caret models (e.g., per imputation)
+  fits_list <- if (inherits(fit_obj, "train")) list(fit_obj) else fit_obj
+
+  imp_list <- lapply(fits_list, function(one_fit) {
+    vi <- caret::varImp(one_fit)$importance
+
+    # vi sometimes is a vector-like 1-col df; sometimes multiple cols
+    vi_df <- data.frame(
+      Feature = rownames(vi),
+      Importance = as.numeric(vi[[1]]),
+      stringsAsFactors = FALSE
+    )
+    rownames(vi_df) <- NULL
+    vi_df
+  })
+
+  # align by Feature, fill missing with 0, then average
+  all_features <- sort(unique(unlist(lapply(imp_list, `[[`, "Feature"))))
+
+  imp_mat <- sapply(imp_list, function(df_imp) {
+    vals <- setNames(df_imp$Importance, df_imp$Feature)
+    out <- vals[all_features]
+    out[is.na(out)] <- 0
+    as.numeric(out)
+  })
+
+  avg_imp <- rowMeans(imp_mat)
+
+  out_df <- data.frame(Feature = all_features, Importance = avg_imp, stringsAsFactors = FALSE)
+  out_df <- out_df[order(out_df$Importance, decreasing = TRUE), ]
+  out_df
+}
+
+# -------------------------------
+# Helper function: Random Forest
+# -------------------------------
+get_rf_varimp <- function(rf_list) {
+  imp_list <- lapply(rf_list, function(m) {
+    # Use %IncMSE for importance
+    data.frame(Feature = rownames(m$importance),
+               Importance = m$importance[, "%IncMSE"])
+  })
+  
+  # Average importance across imputations
+  all_features <- unique(unlist(lapply(imp_list, function(x) x$Feature)))
+  
+  avg_imp <- sapply(all_features, function(f) {
+    mean(sapply(imp_list, function(x) {
+      if (f %in% x$Feature) x$Importance[x$Feature == f] else NA
+    }), na.rm = TRUE)
+  })
+  
+  data.frame(Feature = all_features, Importance = avg_imp) %>%
+    arrange(desc(Importance))
+}
+
+# -------------------------------
+# Helper function: XGBoost
+# -------------------------------
+get_xgb_varimp <- function(xgb_list) {
+  imp_list <- lapply(xgb_list, function(m) {
+    imp <- xgb.importance(model = m$finalModel)
+    data.frame(Feature = imp$Feature, Importance = imp$Gain)
+  })
+  
+  # Average importance across imputations
+  all_features <- unique(unlist(lapply(imp_list, function(x) x$Feature)))
+  
+  avg_imp <- sapply(all_features, function(f) {
+    mean(sapply(imp_list, function(x) {
+      if (f %in% x$Feature) x$Importance[x$Feature == f] else NA
+    }), na.rm = TRUE)
+  })
+  
+  data.frame(Feature = all_features, Importance = avg_imp) %>%
+    arrange(desc(Importance))
+}
+
+# -------------------------------
+# Generate importance data frames
+# -------------------------------
+lm_imp  <- get_caret_varimp(lm_fit)
+gam_imp <- get_caret_varimp(gam_fit)
+rf_imp  <- get_rf_varimp(rf_fit)
+xgb_imp <- get_xgb_varimp(xgb_fit)
+
+# -------------------------------
+# Plot function
+# -------------------------------
+plot_varimp <- function(df, title) {
+  ggplot(df, aes(x = reorder(Feature, Importance), y = Importance)) +
+    geom_col(fill = "steelblue") +
+    coord_flip() +
+    labs(title = title, x = "Feature", y = "Importance") +
+    theme_minimal()
+}
+
+# -------------------------------
+# Plot all models
+# -------------------------------
+plot_varimp(lm_imp, "LM Variable Importance")
+plot_varimp(gam_imp, "GAM Variable Importance")
+plot_varimp(rf_imp, "Random Forest Variable Importance")
+plot_varimp(xgb_imp, "XGBoost Variable Importance")
+
+# Combine the feature importance data into a single data frame
+combine_varimp <- function(lm_imp, gam_imp, rf_imp, xgb_imp) {
+  # Add model names to each importance data frame
+  lm_imp$Model <- "Linear Regression"
+  gam_imp$Model <- "Generalized Additive Model"
+  rf_imp$Model <- "Random Forest"
+  xgb_imp$Model <- "XGBoost"
+  
+  # Combine all model importance data frames
+  combined_imp <- rbind(lm_imp, gam_imp, rf_imp, xgb_imp)
+  
+  # Make sure Features are factor to handle the plot properly
+  combined_imp$Feature <- factor(combined_imp$Feature, levels = unique(combined_imp$Feature))
+  
+  return(combined_imp)
+}
+
+# Combine importance from all models
+combined_imp <- combine_varimp(lm_imp, gam_imp, rf_imp, xgb_imp)
+
+# Print the combined feature importance data
+print(combined_imp)
+```
+
+```{r publishable feature importance plots}
+###############################################
+# Random Forest Feature Importance Figure
+###############################################
+library(ggplot2)
+library(dplyr)
+
+# Extract RF importance from imputation 1
+imp <- importance(rf_fit[[1]])
+
+imp_df <- data.frame(
+  Variable = rownames(imp),
+  Importance = imp[, 1],
+  row.names = NULL
+)
+
+# Clean variable labels
+label_names <- c(
+  ph_p_pds_001 = "PDS Parent: Growth Spurt",
+  ph_p_pds__m_001 = "PDS Parent: Voice Change",
+  ph_p_pds__m_002 = "PDS Parent: Facial Hair",
+  ph_p_pds__f_001 = "PDS Parent: Breast Development",
+  ph_p_pds__f_002 = "PDS Parent: Menarche Status",
+  ph_y_pds_001 = "PDS Youth: Growth Spurt",
+  ph_y_pds__m_001 = "PDS Youth: Voice Change",
+  ph_y_pds__m_002 = "PDS Youth: Facial Hair",
+  ph_y_pds__f_001 = "PDS Youth: Breast Development",
+  ph_y_pds__f_002 = "PDS Youth: Menarche Status",
+  ph_y_phs__ert_mean = "Testosterone",
+  ph_p_pds_002 = "PDS Parent: Body Hair",
+  ph_p_pds_003 = "PDS Parent: Skin Changes",
+  ph_y_pds_002 = "PDS Youth: Body Hair",
+  ph_y_pds_003 = "PDS Youth: Skin Changes",
+  ph_y_phs__dhea_mean = "DHEA",
+  ph_y_phs__hse_mean = "Estradiol"
+)
+
+imp_df <- imp_df %>%
+  mutate(
+    Variable = recode(Variable, !!!label_names)
+  ) %>%
+  arrange(Importance) %>%
+  mutate(
+    Variable = factor(Variable, levels = Variable)
+  )
+
+# Lollipop plot
+ggplot(imp_df, aes(x = Importance, y = Variable)) +
+  geom_segment(
+    aes(x = 0, xend = Importance, y = Variable, yend = Variable),
+    linewidth = 1,
+    color = "gray70"
+  ) +
+  geom_point(size = 4, color = "pink") +
+  labs(
+    x = "% Feature Importance",
+    y = NULL,
+    title = "Female Gonadal Pubertal Age"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 12)
+  )
+```
+
+```{r final full-sample pubertal age gap scoring}
+
+# =========================================================
+# FINAL FULL-SAMPLE SCORING MODEL FOR Gonadal PUBERTAL AGE
+# =========================================================
+# Purpose:
+# This chunk is for constructing the final derived variable:
+#   1) predicted gonadal pubertal age
+#   2) gonadal pubertal age z-score
+#
+# This is NOT for holdout performance evaluation.
+# It is the final scoring stage after model strategy is chosen.
+# =========================================================
+
+library(dplyr)
+library(mice)
+library(caret)
+library(randomForest)
+library(ggplot2)
+
+# ---------------------------------------------------------
+# 1. Define outcome and predictor set
+# ---------------------------------------------------------
+target_str <- "ph_y_pds_age"
+
+predictors_age_gonadal <- predictors_age_gonadal
+
+formula_obj <- as.formula(
+  paste(target_str, "~", paste(predictors_age_gonadal, collapse = " + "))
+)
+
+print(formula_obj)
+
+# ---------------------------------------------------------
+# 2. Build final analytic sample
+#    Keep only needed variables and require non-missing age
+# ---------------------------------------------------------
+final_analysis_df <- abcd_female %>%
+  select(participant_id,all_of(c(target_str, predictors_age_gonadal))) %>%
+  filter(!is.na(.data[[target_str]]))
+
+final_ids <- final_analysis_df$participant_id
+final_analysis_df_model <- final_analysis_df %>% select(-participant_id)
+
+cat("Final analytic N =", nrow(final_analysis_df), "\n")
+
+# Optional: inspect missingness
+missing_counts <- sapply(final_analysis_df, function(x) sum(is.na(x)))
+print(missing_counts)
+
+# ---------------------------------------------------------
+# 3. Multiple imputation on FULL analytic sample
+# ---------------------------------------------------------
+set.seed(999)
+
+final_imp <- mice(
+  final_analysis_df_model,
+  m = 5,
+  maxit = 10,
+  seed = 999,
+  printFlag = TRUE
+)
+
+final_sets <- complete(final_imp, action = "all")
+
+# ---------------------------------------------------------
+# 4. Scale predictors
+# ---------------------------------------------------------
+# Because this is the final scoring model on the full sample,
+# scaling on the full imputed analytic sample is acceptable.
+# To keep scaling consistent across imputations, estimate the
+# centering/scaling parameters from imputation 1, then apply
+# them to all imputed datasets.
+
+numeric_predictors <- predictors_age_gonadal[
+  sapply(final_sets[[1]][, predictors_age_gonadal, drop = FALSE], is.numeric)
+]
+
+pp_final <- preProcess(
+  final_sets[[1]][, numeric_predictors, drop = FALSE],
+  method = c("center", "scale")
+)
+
+final_sets <- lapply(final_sets, function(df) {
+  df[, numeric_predictors] <- predict(pp_final, df[, numeric_predictors, drop = FALSE])
+  df
+})
+
+# ---------------------------------------------------------
+# 5. Fit final Random Forest model on each imputed dataset
+# ---------------------------------------------------------
+set.seed(999)
+
+final_rf <- lapply(seq_along(final_sets), function(i) {
+  cat("\n==============================\n")
+  cat("Fitting FINAL Random Forest — Imputation", i, "\n")
+  cat("==============================\n")
+
+  randomForest(
+    formula = formula_obj,
+    data = final_sets[[i]],
+    ntree = 500,
+    importance = TRUE,
+    do.trace = 50
+  )
+})
+
+# ---------------------------------------------------------
+# 6. Generate predicted pubertal age for each imputation
+# ---------------------------------------------------------
+pred_mat <- sapply(seq_along(final_rf), function(i) {
+  predict(final_rf[[i]], newdata = final_sets[[i]])
+})
+
+# Average predicted pubertal age across imputations
+pubertal_age_pred_mean <- rowMeans(pred_mat)
+
+# Also compute optional between-imputation SD of predictions
+pubertal_age_pred_sd <- apply(pred_mat, 1, sd)
+
+# ---------------------------------------------------------
+# 7. Create final scored dataset
+# ---------------------------------------------------------
+# Use imputation 1 as the base dataset for storing pooled
+# prediction summaries. The prediction itself is averaged
+# across all imputations.
+
+full_df_scored <- final_sets[[1]]
+full_df_scored$participant_id <- final_ids
+
+#chronological age at wave 0
+full_df_scored$chronological_age_wave0 <- full_df_scored[[target_str]]
+
+#pubertal age: RF predicted chronological age
+full_df_scored$female_gonadal_pubertal_age <- pubertal_age_pred_mean
+
+#Between-imputation SD of pubertal age predictions
+full_df_scored$female_gonadal_pubertal_age_pred_sd <- pubertal_age_pred_sd
+
+#Final timing metric z-scoring gonadal pubertal age
+full_df_scored$female_gonadal_pubertal_timing_z <- as.numeric(scale(full_df_scored$female_gonadal_pubertal_age))
+
+# ---------------------------------------------------------
+# 8. Quick distribution checks
+# ---------------------------------------------------------
+cat("\nPredicted gonadal pubertal age summary:\n")
+print(summary(full_df_scored$female_gonadal_pubertal_age))
+
+cat("\nGonadal Pubertal age prediction SD:\n")
+print(summary(full_df_scored$female_gonadal_pubertal_age_pred_sd))
+
+cat("\nFemale gonadal pubertal timing z-score summary:\n")
+print(summary(full_df_scored$female_gonadal_pubertal_timing_z))
+
+cat("\nFemale gonadal pubertal timing z-score SD:\n")
+print(sd(full_df_scored$female_gonadal_pubertal_timing_z,na.rm=TRUE))
+
+mu <- mean(full_df_scored$female_gonadal_pubertal_age, na.rm = TRUE)
+sigma <- sd(full_df_scored$female_gonadal_pubertal_age, na.rm = TRUE)
+
+ggplot(full_df_scored, aes(x = female_gonadal_pubertal_age)) +
+  geom_histogram(bins = 30,
+                 alpha=0.8) +
+
+  # Mean
+  geom_vline(xintercept = mu, linewidth = 1) +
+
+  # ±1 SD
+  geom_vline(
+    xintercept = c(mu - sigma, mu + sigma),
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+
+  # ±2 SD
+  geom_vline(
+    xintercept = c(mu - 2*sigma, mu + 2*sigma),
+    linetype = "dotted",
+    linewidth = 1
+  ) +
+
+  labs(
+    title = "Female Gonadal Pubertal Age",
+    x = "Gonadal Pubertal Age",
+    y = "Count"
+  ) +
+
+  theme_minimal()
+
+
+
+
+# Q-Q plot
+qqnorm(full_df_scored$female_gonadal_pubertal_timing_z,
+       main = "Q-Q Plot of Gonadal Pubertal Timing Z-score")
+
+
+
+# ---------------------------------------------------------
+# 10. Optional: examine variable importance
+# ---------------------------------------------------------
+rf_importance_list <- lapply(final_rf, importance)
+
+# Example: importance from first imputation
+print(rf_importance_list[[1]])
+####
+#Correlation between age gap and age
+```
+
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+
